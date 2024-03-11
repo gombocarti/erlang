@@ -138,7 +138,11 @@ type Name = String
 data Node 
     = Short Name         -- ^ Local Erlang node.
     | Long Name HostName -- ^ Remote Erlang node.
-      deriving (Eq,Show)
+      deriving Eq
+
+instance Show Node where
+  show (Short name) = name ++ "@" ++ epmdLocal
+  show (Long name host) = name ++ "@" ++ host
 
 instance Erlang Node where
     toErlang (Short name)   = ErlString name
