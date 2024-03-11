@@ -14,15 +14,20 @@ module Foreign.Erlang.Network (
     epmdGetNames
   , epmdGetPort
   , epmdGetPortR4
-  
+  , EpmdPort(..)
+  , getEpmdPort
   , ErlRecv
   , ErlSend
   -- ** Representation of Erlang nodes
   , Name
   , HostName
   , Node(..)
+  , node
+  , getNodeIp
+  , nodeName
   , erlConnect
   , toNetwork
+  , Challenge(..)
   ) where
 
 import Control.Exception        (assert, bracketOnError)
