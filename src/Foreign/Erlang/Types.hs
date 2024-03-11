@@ -1,4 +1,3 @@
-{-# LANGUAGE OverlappingInstances #-}
 {-# OPTIONS -XFlexibleInstances -XTypeSynonymInstances #-}
 
 -- |
@@ -21,8 +20,8 @@ module Foreign.Erlang.Types (
   , nth
 
   -- ** Internal packing functions
-  , getA, getC, getErl, getN, geta, getn
-  , putA, putC, putErl, putN, puta, putn
+  , getA, getC, getErl, getN, getM, geta, getn
+  , putA, putC, putErl, putN, putM, puta, putn
   , tag
   ) where
 
@@ -38,7 +37,7 @@ import Data.Char          (chr, ord, isPrint)
 import qualified Data.ByteString.Lazy       as B
 import qualified Data.ByteString.Lazy.Char8 as C
 import qualified Data.ByteString.Char8      as BB
-import Data.ByteString.Lazy.Builder
+import Data.ByteString.Builder
 
 import qualified Data.ByteString            as Byte
 import Data.ByteString (ByteString)
@@ -68,32 +67,32 @@ class Erlang a where
     toErlang   :: a -> ErlType
     fromErlang :: ErlType -> a
 
-instance Erlang ErlType where
+instance {-# OVERLAPPING #-} Erlang ErlType where
     toErlang   = Prelude.id
     fromErlang = Prelude.id
 
-instance Erlang Int where
-    toErlang   x             
-       | abs x <= 0x7FFFFFFF = ErlInt x        
+instance {-# OVERLAPPING #-} Erlang Int where
+    toErlang   x
+       | abs x <= 0x7FFFFFFF = ErlInt x
        | otherwise           = ErlBigInt (fromIntegral x) -- Haskell Int (might) use 64 bits whether erlang's small Int use only 32 bit
 
     fromErlang (ErlInt x)    = x
     fromErlang (ErlBigInt x) = fromIntegral x
 
-instance Erlang Double where
-    toErlang   x            = ErlFloat x 
+instance {-# OVERLAPPING #-} Erlang Double where
+    toErlang   x            = ErlFloat x
     fromErlang (ErlFloat x) = x
 
-instance Erlang Float where
+instance {-# OVERLAPPING #-} Erlang Float where
     toErlang x              = ErlFloat (realToFrac x)
     fromErlang (ErlFloat x) = realToFrac x
 
-instance Erlang Integer where
+instance {-# OVERLAPPING #-} Erlang Integer where
     toErlang   x             = ErlBigInt x
     fromErlang (ErlInt x)    = fromIntegral x
     fromErlang (ErlBigInt x) = x
 
-instance Erlang String where
+instance {-# OVERLAPPING #-} Erlang String where
     toErlang   x             = ErlString x
     fromErlang ErlNull       = ""
     fromErlang (ErlString x) = x
@@ -101,37 +100,37 @@ instance Erlang String where
     fromErlang (ErlList xs)  = map (chr . fromErlang) xs
     fromErlang x             = error $ "can't convert to string: " ++ show x
 
-instance Erlang Bool where
+instance {-# OVERLAPPING #-} Erlang Bool where
     toErlang   True              = ErlAtom "true"
     toErlang   False             = ErlAtom "false"
     fromErlang (ErlAtom "true")  = True
     fromErlang (ErlAtom "false") = False
 
-instance Erlang [ErlType] where
+instance {-# OVERLAPPING #-} Erlang [ErlType] where
     toErlang   []           = ErlNull
     toErlang   xs           = ErlList xs
     fromErlang ErlNull      = []
     fromErlang (ErlList xs) = xs
 
-instance Erlang a => Erlang [a] where
+instance {-# OVERLAPPING #-} Erlang a => Erlang [a] where
     toErlang   []           = ErlNull
     toErlang   xs           = ErlList . map toErlang $ xs
     fromErlang ErlNull      = []
     fromErlang (ErlList xs) = map fromErlang xs
 
-instance (Erlang a, Erlang b) => Erlang (a, b) where
+instance {-# OVERLAPPING #-} (Erlang a, Erlang b) => Erlang (a, b) where
     toErlang   (x, y)            = ErlTuple [toErlang x, toErlang y]
     fromErlang (ErlTuple [x, y]) = (fromErlang x, fromErlang y)
 
-instance (Erlang a, Erlang b, Erlang c) => Erlang (a, b, c) where
+instance {-# OVERLAPPING #-} (Erlang a, Erlang b, Erlang c) => Erlang (a, b, c) where
     toErlang   (x, y, z)            = ErlTuple [toErlang x, toErlang y, toErlang z]
     fromErlang (ErlTuple [x, y, z]) = (fromErlang x, fromErlang y, fromErlang z)
 
-instance (Erlang a, Erlang b, Erlang c, Erlang d) => Erlang (a, b, c, d) where
+instance {-# OVERLAPPING #-} (Erlang a, Erlang b, Erlang c, Erlang d) => Erlang (a, b, c, d) where
     toErlang   (x, y, z, w)            = ErlTuple [toErlang x, toErlang y, toErlang z, toErlang w]
     fromErlang (ErlTuple [x, y, z, w]) = (fromErlang x, fromErlang y, fromErlang z, fromErlang w)
 
-instance (Erlang a, Erlang b, Erlang c, Erlang d, Erlang e) => Erlang (a, b, c, d, e) where
+instance {-# OVERLAPPING #-} (Erlang a, Erlang b, Erlang c, Erlang d, Erlang e) => Erlang (a, b, c, d, e) where
     toErlang   (x, y, z, w, a)            = ErlTuple [toErlang x, toErlang y, toErlang z, toErlang w, toErlang a]
     fromErlang (ErlTuple [x, y, z, w, a]) = (fromErlang x, fromErlang y, fromErlang z, fromErlang w, fromErlang a)
 
@@ -252,6 +251,16 @@ getErl = do
 
       'w' -> getC >>= liftM ErlAtom . getA
 
+      'X' -> do
+        node <- getErl
+        id <- getN
+        serial <- getN
+        creation <- getN
+        return $ ErlPid node id serial creation
+
+      'Z' -> do -- XXX ref
+        error "FIXME ref"
+
       x -> fail $ "Unsupported serialization code: " ++ show (ord x)
 
 
@@ -290,6 +299,9 @@ putn = word16BE . fromIntegral
 putN :: Integral a => a -> Builder
 putN = word32BE . fromIntegral
 
+putM :: Integral a => a -> Builder
+putM = word64BE . fromIntegral
+
 puta :: [Word8] -> Builder
 puta = lazyByteString . B.pack
 
@@ -304,6 +316,9 @@ getn = liftM fromIntegral getWord16be
 
 getN :: Get Int
 getN = liftM fromIntegral getWord32be
+
+getM :: Get Int
+getM = liftM fromIntegral getWord64be
 
 geta :: Int -> Get [Word8]
 geta = liftM B.unpack . getLazyByteString . fromIntegral
