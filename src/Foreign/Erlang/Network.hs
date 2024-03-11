@@ -14,15 +14,20 @@ module Foreign.Erlang.Network (
     epmdGetNames
   , epmdGetPort
   , epmdGetPortR4
-  
+  , EpmdPort(..)
+  , getEpmdPort
   , ErlRecv
   , ErlSend
   -- ** Representation of Erlang nodes
   , Name
   , HostName
   , Node(..)
+  , node
+  , getNodeIp
+  , nodeName
   , erlConnect
   , toNetwork
+  , Challenge(..)
   ) where
 
 import Control.Exception        (assert, bracketOnError)
@@ -34,38 +39,24 @@ import Data.Hash.MD5            (md5i, Str(..))
 import Data.List                (unfoldr)
 import Data.Word
 import Foreign.Erlang.Types
-import Network                  
+import Network.Socket
+import qualified Network.BSD as BSD
 import System.Directory         (getHomeDirectory)
 import System.FilePath          ((</>))
 import System.IO
 import System.Random            (randomIO)
 import qualified Data.ByteString.Lazy.Char8 as B
-import Data.ByteString.Lazy.Builder
+import Data.ByteString.Builder
 import Data.Monoid ((<>),mempty)
 
-erlangVersion :: Int
-erlangVersion = 5
+-- erlangVersion :: Int
+-- erlangVersion = 5
 
 erlangProtocolVersion :: Int
 erlangProtocolVersion = 131
 
 passThrough :: Char
 passThrough = 'p'
-
-flagPublished          =  0x01
-flagAtomCache          =  0x02
-flagExtendedReferences =  0x04
-flagDistMonitor        =  0x08
-flagFunTags            =  0x10
-flagDistMonitorName    =  0x20
-flagHiddenAtomCache    =  0x40
-flagNewFunTags         =  0x80
-flagExtendedPidsPorts  = 0x100
-flagUTF8Atoms          = 0x10000
-
-flagExtendedReferences :: Word32
-flagExtendedPidsPorts  :: Word32
-flagUTF8Atoms          :: Word32
 
 getUserCookie :: IO String
 getUserCookie = do
@@ -147,59 +138,157 @@ type Name = String
 data Node 
     = Short Name         -- ^ Local Erlang node.
     | Long Name HostName -- ^ Remote Erlang node.
-      deriving (Eq,Show)
+      deriving Eq
+
+instance Show Node where
+  show (Short name) = name ++ "@" ++ epmdLocal
+  show (Long name host) = name ++ "@" ++ host
 
 instance Erlang Node where
     toErlang (Short name)   = ErlString name
     toErlang (Long name ip) = ErlString name
     fromErlang = undefined
-          
+
+node :: String -> Node
+node spec = let (name, _:host) = break (== '@') spec in Long name host
+
+getNodeIp :: Node -> IO String
+getNodeIp (Short name) = return epmdLocal
+getNodeIp (Long name host) = resolve host
+
+nodeName :: Node -> String
+nodeName (Short name) = name
+nodeName (Long name host) = name
+
 erlConnect :: String -> Node -> IO (ErlSend, ErlRecv)
 erlConnect self node = withSocketsDo $ do
-    port <- epmdGetPort node
-    let port' = PortNumber . fromIntegral $ port
-    withNode epmd port' $ \h -> do
-        let out = sendMessage packn (hPutBuilder h)
-        let inf = recvMessage 2 (B.hGet h)
-        handshake out inf self
-        let out' = sendMessage packN (hPutBuilder h)
-        let inf' = recvMessage 4 (B.hGet h)
-        return (erlSend out', erlRecv inf')
-    where epmd = case node of
-                   Short _    -> epmdLocal
-                   Long  _ ip -> ip
+  ip <- getNodeIp node
+  port <- getEpmdPort node
+  let port' = PortNumber . fromIntegral . epmdNodePort $ port
+  withNode ip port' $ \h -> do
+    let out = sendMessage packn (hPutBuilder h)
+    let inf = recvMessage 2 (B.hGet h)
+    challenge <- handshake out inf self
+    let out' = sendMessage packN (hPutBuilder h)
+    let inf' = recvMessage 4 (B.hGet h)
+    return (erlSend out', erlRecv inf')
 
-                     
-handshake :: (Builder -> IO ()) -> IO B.ByteString -> String -> IO ()
+data Challenge = Challenge {
+                  challengeFlags        :: Int,
+                  challengeSalt         :: Word32,
+                  challengeThisCreation :: Int,
+                  challengeThatCreation :: Int
+                } deriving (Show, Eq)
+
+handshake :: (Builder -> IO ()) -> IO B.ByteString -> String -> IO Challenge
 handshake out inf self = do
     cookie <- getUserCookie
     sendName
     recvStatus
     challenge <- recvChallenge
-    let reply = erlDigest cookie challenge
+    let reply = erlDigest cookie $ challengeSalt challenge
     challenge' <- liftM fromIntegral (randomIO :: IO Int)
     challengeReply reply challenge'
     recvChallengeAck cookie challenge'
+    return challenge
 
   where
+    flagPublished          =  0x01
+    flagAtomCache          =  0x02
+    flagExtendedReferences =  0x04
+    flagDistMonitor        =  0x08
+    flagFunTags            =  0x10
+    flagDistMonitorName    =  0x20
+    flagHiddenAtomCache    =  0x40
+    flagNewFunTags         =  0x80
+    flagExtendedPidsPorts  = 0x100
+    flagExportPtrTag       = 0x200
+    flagBitBinaries        = 0x400
+    flagNewFloats          = 0x800
+    flagUnicodeIO          = 0x1000
+    flagDistHdrAtomCache   = 0x2000
+    flagUTF8Atoms          = 0x10000
+    flagMapTag             = 0x20000
+    flagBigCreation        = 0x40000
+
+    flagHANDSHAKE_23      :: Word32
+    flagHANDSHAKE_23       = 0x1000000
+
+    flags' = 0x0000000d07df7fbd; -- Erlang/OTP 25 [erts-13.2.2.4]
+    -- .... .... .... .... .... .... .... .... .... = Spare: 0
+    -- 1... .... .... .... .... .... .... .... .... = Alias: True
+    -- .1.. .... .... .... .... .... .... .... .... = V4 NC: True
+    -- ..0. .... .... .... .... .... .... .... .... = Name ME: False
+    -- ...1 .... .... .... .... .... .... .... .... = Spawn: True
+    -- .... 0000 01.. .... .... .... .... .... .... = Reserved: 1
+    -- .... .... ..1. .... .... .... .... .... .... = Unlink Id: True
+    -- .... .... ...1 .... .... .... .... .... .... = Handshake 23: True
+    -- .... .... .... 1... .... .... .... .... .... = Fragments: True
+    -- .... .... .... .1.. .... .... .... .... .... = Exit Payload: True
+    -- .... .... .... ..0. .... .... .... .... .... = Pending Connect: False
+    -- .... .... .... ...1 .... .... .... .... .... = Big Seqtrace Labels: True
+    -- .... .... .... .... 1... .... .... .... .... = Send Sender: True
+    -- .... .... .... .... .1.. .... .... .... .... = Big Creation: True
+    -- .... .... .... .... ..1. .... .... .... .... = Map Tag: True
+    -- .... .... .... .... ...1 .... .... .... .... = UTF8 Atoms: True
+    -- .... .... .... .... .... 0... .... .... .... = ETS Compressed: False
+    -- .... .... .... .... .... .1.. .... .... .... = Small Atom Tags: True
+    -- .... .... .... .... .... ..1. .... .... .... = Dist HDR Atom Cache: True
+    -- .... .... .... .... .... ...1 .... .... .... = Unicode IO: True
+    -- .... .... .... .... .... .... 1... .... .... = New Floats: True
+    -- .... .... .... .... .... .... .1.. .... .... = Bit Binaries: True
+    -- .... .... .... .... .... .... ..1. .... .... = Export PTR Tag: True
+    -- .... .... .... .... .... .... ...1 .... .... = Extended Pids Ports: True
+    -- .... .... .... .... .... .... .... 1... .... = New Fun Tags: True
+    -- .... .... .... .... .... .... .... .0.. .... = Hidden Atom Cache: False
+    -- .... .... .... .... .... .... .... ..1. .... = Dist Monitor Name: True
+    -- .... .... .... .... .... .... .... ...1 .... = Fun Tags: True
+    -- .... .... .... .... .... .... .... .... 1... = Dist Monitor: True
+    -- .... .... .... .... .... .... .... .... .1.. = Extended References: True
+    -- .... .... .... .... .... .... .... .... ..0. = Atom Cache: False
+    -- .... .... .... .... .... .... .... .... ...1 = Published: True
+    flags = flagHANDSHAKE_23
+          .|. flagExtendedReferences
+          .|. flagExtendedPidsPorts
+          .|. flagUTF8Atoms
+          .|. flagNewFunTags
+          .|. flagBigCreation
+          .|. flagMapTag
+          .|. flagNewFloats
+          .|. flagBitBinaries
+          .|. flagExportPtrTag
+          .|. flagFunTags
+          .|. flagUnicodeIO
+          -- .|. flagDistHdrAtomCache -- XXX need DistributionHeader
+          -- .|. flagPublished
+
+    creation = 0x3700037 -- FIXME ¿¿¿
+
     sendName = out $
-        tag 'n' <>
-        putn erlangVersion <>
-        putN (flagExtendedReferences .|. flagExtendedPidsPorts .|. flagUTF8Atoms) <>
+        tag 'N' <>
+        putM flags <>
+        putN creation <>
+        putn (length self) <>
         putA self
 
-    recvStatus = do
-        msg <- inf
-        assert ("sok" == B.unpack msg) $ return ()
+    recvStatus = fmap B.unpack inf >>= \msg ->
+        case msg of
+          "sok" -> return ()
+          -- "ok_simultaneous" -> return () -- XXX enable with flagPublished
+          "snot_allowed" -> error "handshake: they say we're not allowed"
+          "salive" -> out $ putA "strue" -- restart
+          status -> error $ "handshake: failed, status: " ++ status
 
     recvChallenge = do
         msg <- inf
-        return . flip runGet msg $ do
-            _tag <- getC
-            _version <- getn 
-            _flags <- getN
-            challenge <- getWord32be
-            return challenge
+        return . flip runGet msg $ getC >>= \tag ->
+          if tag /= ord 'N'
+            then error $ "handshake: incompatible protocol: " ++ show tag
+            else do
+              flags <- getM
+              challenge <- getWord32be
+              creation' <- getN
+              return $ Challenge flags challenge creation creation'
 
     challengeReply reply challenge = out $
         tag 'r' <>
@@ -210,7 +299,9 @@ handshake out inf self = do
         let digest = erlDigest cookie challenge
         msg <- inf
         let reply = take 16 . tail . map (fromIntegral . ord) . B.unpack $ msg
-        assert (digest == reply) $ return ()
+        if digest == reply
+          then return ()
+          else error "handshake: digest mismath"
 
 epmdLocal :: HostName
 epmdLocal = "127.0.0.1"
@@ -271,3 +362,67 @@ epmdGetPortR4 epmd name = do
         name <- getn >>= getA
         extra <- liftM B.unpack getRemainingLazyByteString
         return (port, nodeType, protocol, vsnMax, vsnMin, name, extra)
+
+data EpmdPort = EpmdPort {
+                  epmdNodePort  :: Int,
+                  epmdNodeType  :: Int,
+                  epmdProtocol  :: Int,
+                  epmdVsnMax    :: Int,
+                  epmdVsnMin    :: Int,
+                  epmdNodeName  :: String,
+                  epmdExtra     :: String
+                } deriving (Show, Eq)
+
+getEpmdPort :: Node -> IO EpmdPort
+getEpmdPort node = do
+  ip <- getNodeIp node
+  reply <- epmdSend ip $ 'z' : nodeName node
+  return $ flip runGet reply $ do
+    tag <- getC
+    if tag /= ord 'w'
+      then error $ "getEpmdPort: unexpected tag: " ++ show tag
+      else getC >>= \result ->
+        case result of
+          err | err > 1 -> error $ "getEpmdPort: failed: " ++ show err
+          1 -> error $ "getEpmdPort: node not found: " ++ show node
+          0 -> do
+            port <- getn
+            nodeType <- getC
+            protocol <- getC
+            vsnMax <- getn
+            vsnMin <- getn
+            name <- getn >>= getA
+            extra <- liftM B.unpack getRemainingLazyByteString
+            return $ EpmdPort port nodeType protocol vsnMax vsnMin name extra
+
+-- setEpmdPort :: EpmdPort -> IO ()
+
+-- XXX compat
+data PortID = PortNumber PortNumber
+connectTo :: HostName         -- Hostname
+          -> PortID             -- Port Identifier
+          -> IO Handle          -- Connected Socket
+connectTo hostname (PortNumber port) = do
+    proto <- BSD.getProtocolNumber "tcp"
+    bracketOnError
+        (socket AF_INET Stream proto)
+        (close)  -- only done if there's an error
+        (\sock -> do
+          he <- BSD.getHostByName hostname
+          connect sock (SockAddrInet port (BSD.hostAddress he))
+          socketToHandle sock ReadWriteMode
+        )
+
+inet_addr :: HostName -> IO HostAddress
+inet_addr hostname = do
+  let hints = defaultHints { addrFlags = [AI_NUMERICHOST], addrSocketType = Stream }
+  addr:_ <- getAddrInfo (Just hints) (Just hostname) Nothing
+  let SockAddrInet _ address = addrAddress addr
+  return address
+
+resolve :: String -> IO String -- TODO IPv6
+resolve = liftM hostEntryToString . BSD.getHostByName where
+  hostEntryToString = tupleToString . hostAddressToTuple . BSD.hostAddress
+  tupleToString (a,b,c,d) = foldr tupleFold "" [d,c,b,a]
+  tupleFold v "" = show v
+  tupleFold v a = a ++ "." ++ show v
