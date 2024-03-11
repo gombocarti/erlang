@@ -30,6 +30,7 @@ library
                      filepath,
                      MissingH,
                      network >= 2.2.0.1,
+                     network-bsd >= 2.8,
                      random >= 1.0.0.1
   exposed-modules:   Foreign.Erlang
   other-modules:     Foreign.Erlang.Network,
